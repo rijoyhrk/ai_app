@@ -2,6 +2,7 @@
 .venv/
 venv/
 chroma_db/
+lib/
 __pycache__/
 *.pyc
 *.pyo
