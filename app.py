@@ -64,11 +64,13 @@ def _init_state():
         "engine": None,
         "ingested": False,
         "results": [],
+        "rerank_skipped": False,
         "query": "",
         "etl_path": settings.etl_repo_path,
         "excluded_dirs": "",
         "indexed_path": "",
         "indexed_excluded": [],
+        "skip_rerank": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -103,7 +105,33 @@ def _parse_excluded(raw: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def _do_search(query: str) -> list:
+def _fallback_format(hits: list) -> list:
+    """
+    Format hybrid search hits to match reranker output shape when the API
+    is unavailable. Infers operation from metadata, sets score = hybrid_score.
+    """
+    results = []
+    for h in hits:
+        meta = h.get("metadata", {})
+        ops = meta.get("operations", "")
+        # pick the first operation listed in metadata, default UNKNOWN
+        operation = ops.split("|")[0].strip().upper() if ops else "UNKNOWN"
+        result = dict(h)
+        result["operation"]    = operation
+        result["explanation"]  = "LLM reranking skipped — showing hybrid search score."
+        result["matched_via"]  = "alias" if meta.get("aliases_used") else "direct"
+        result["llm_score"]    = 0.0
+        result["final_score"]  = round(h.get("hybrid_score", 0.0), 4)
+        results.append(result)
+    results.sort(key=lambda x: x["final_score"], reverse=True)
+    return results
+
+
+def _do_search(query: str) -> tuple[list, bool]:
+    """
+    Returns (results, rerank_skipped).
+    rerank_skipped=True means the API was unavailable and hybrid results are returned directly.
+    """
     store: VectorStore = st.session_state.store
     registry: AliasRegistry = st.session_state.registry
     client = get_anthropic_client()
@@ -124,8 +152,21 @@ def _do_search(query: str) -> list:
 
     engine: HybridSearchEngine = st.session_state.engine
     hits = engine.search(query, top_k=15)
-    ranked = rerank(client, query, hits, model=settings.llm_model, min_score=0.25)
-    return ranked
+
+    skip_rerank = st.session_state.get("skip_rerank", False)
+    if skip_rerank:
+        return _fallback_format(hits), True
+
+    try:
+        ranked = rerank(client, query, hits, model=settings.llm_model, min_score=0.25)
+        return ranked, False
+    except anthropic.BadRequestError as e:
+        if "credit balance" in str(e).lower() or "billing" in str(e).lower():
+            return _fallback_format(hits), True
+        raise
+    except (anthropic.APIStatusError, anthropic.APIConnectionError,
+            anthropic.RateLimitError, anthropic.APITimeoutError) as e:
+        return _fallback_format(hits), True
 
 
 def _group_by_file(results: list) -> dict:
@@ -222,6 +263,13 @@ with st.sidebar:
         help="Enter any table name — including aliases. The system resolves them automatically.",
         key="query_input",
     )
+    st.session_state.skip_rerank = st.toggle(
+        "⚡ Skip LLM reranking",
+        value=st.session_state.skip_rerank,
+        help="Returns hybrid search results directly without calling the Claude API. "
+             "Use this when credits are low or to save costs.",
+    )
+
     search_clicked = st.button(
         "Search",
         use_container_width=True,
@@ -234,8 +282,9 @@ with st.sidebar:
             st.warning("Please index ETL files first.")
         else:
             with st.spinner(f"Searching for **{table_query.strip()}**…"):
-                results = _do_search(table_query.strip())
+                results, rerank_skipped = _do_search(table_query.strip())
                 st.session_state.results = results
+                st.session_state.rerank_skipped = rerank_skipped
                 st.session_state.query = table_query.strip()
 
     st.divider()
@@ -307,6 +356,15 @@ st.markdown(f"""
   </p>
 </div>
 """, unsafe_allow_html=True)
+
+if st.session_state.rerank_skipped:
+    st.warning(
+        "⚡ **LLM reranking was skipped** — results are ranked by hybrid search score "
+        "(semantic + BM25) without Claude's relevance scoring. "
+        "To enable full reranking, add API credits at [console.anthropic.com](https://console.anthropic.com) "
+        "or turn off the **Skip LLM reranking** toggle if credits are available.",
+        icon="⚠️",
+    )
 
 tabs = st.tabs(["📋 Summary Table", "📄 Script Details", "🕸️ Lineage Graph"])
 
