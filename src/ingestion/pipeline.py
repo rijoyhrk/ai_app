@@ -7,7 +7,7 @@ Full ingestion pipeline:
 """
 import anthropic
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from src.chunkers.dispatcher import crawl_and_chunk
 from src.extractors.entity_extractor import batch_extract_entities
 from src.extractors.alias_registry import AliasRegistry
@@ -21,16 +21,20 @@ def run_ingestion(
     alias_registry_path: str,
     anthropic_client: anthropic.Anthropic,
     llm_model: str = "claude-opus-4-7",
+    excluded_dirs: Optional[list] = None,
     verbose: bool = True,
 ) -> tuple[VectorStore, AliasRegistry]:
     """
     Full ingestion pipeline. Returns the vector store and alias registry.
+    excluded_dirs: list of directory names to skip during crawl.
     """
     log = print if verbose else lambda *a, **k: None
 
     # Step 1: chunk all ETL files
     log(f"[1/4] Crawling and chunking ETL files in: {repo_path}")
-    chunks = crawl_and_chunk(repo_path)
+    if excluded_dirs:
+        log(f"      Skipping dirs: {excluded_dirs}")
+    chunks = crawl_and_chunk(repo_path, excluded_dirs=excluded_dirs)
     log(f"      Found {len(chunks)} chunks across all files")
 
     if not chunks:

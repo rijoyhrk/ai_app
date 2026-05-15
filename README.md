@@ -5,7 +5,15 @@ An intelligent RAG-powered dashboard: enter **any table name** and instantly see
 ## How It Works
 
 ```
-User query: "customer"
+[Input 1] ETL Root Folder  +  [Input 2] Excluded Folders
+       │
+       ▼
+  Crawl & Chunk (.py / .sql / .sh) — skipping excluded dirs
+       │
+       ▼
+  LLM Entity Extraction → Alias Registry (alias → canonical)
+       │
+[Input 3] Table name: "customer"
        │
        ▼
   Alias Registry ──► expands to: customer, cust_tab, cust_data, CUST, cust_tbl
@@ -120,11 +128,49 @@ On first run, click **Re-ingest ETL Files** in the sidebar to crawl your scripts
 
 ## Using the Dashboard
 
-1. **Type any table name** in the search bar (e.g. `customer`, `orders`, `prod_tbl`) and press **Search**.
-2. The **Summary Table** tab shows a deduplicated list of every script that references the table, the operation type (READ / WRITE / CREATE), and which alias was matched.
-3. The **Script Details** tab shows each matching script as a card with expandable code excerpts per chunk.
-4. The **Lineage Graph** tab renders an interactive directed graph — arrows show whether a script reads from or writes to the table.
-5. Use the **⬇️ Download as CSV** button in the Summary Table to export the results.
+The sidebar and main panel expose three input fields:
+
+### Input 1 — ETL Root Folder (sidebar)
+
+Enter the absolute or relative path to the root of your ETL repository.  
+The crawler walks it recursively and picks up all `.py`, `.sql`, and `.sh` files.
+
+```
+📁 ETL Root Folder
+/path/to/your/etl/repo
+```
+
+### Input 2 — Excluded Folders (sidebar)
+
+Optionally list folder names to skip during indexing — one per line or comma-separated.  
+Matches any directory at any depth inside the ETL root (e.g. `archive` will skip `/repo/archive/` and `/repo/jobs/archive/`).
+
+```
+🚫 Excluded Folders
+archive
+deprecated
+tests, legacy
+```
+
+Click **Index ETL Files** to crawl the folder (respecting exclusions), extract entities with Claude, and build the vector index. A status bar shows the active path, excluded folders, and chunk count.
+
+### Input 3 — Table Name (main panel)
+
+Type any table name in the search bar and press **Search**.  
+The system expands the query to all known aliases and runs hybrid search + LLM reranking.
+
+```
+🔎 Search Table
+customer
+```
+
+### Results (3 tabs)
+
+| Tab | What it shows |
+|---|---|
+| **Summary Table** | One row per script — Script, Operations, Matched Via, Aliases Used, Score. Downloadable as CSV. |
+| **Script Details** | Per-file cards with expandable code excerpts per matching chunk, annotated with operation badges. |
+| **Lineage Graph** | Interactive directed graph: table → file (READ) or file → table (WRITE/CREATE). |
 
 ## Example: Alias Resolution in Action
 
@@ -140,13 +186,17 @@ Querying `customer` finds all five sample scripts. The **Summary Table** output 
 
 None of these scripts use the exact word `customer` everywhere — alias resolution bridges the gap automatically.
 
-## Using Your Own ETL Repository
+## Pointing at Your Own ETL Repository
 
-1. Set `ETL_REPO_PATH` in `.env` to the root of your ETL repo (absolute or relative path).
-2. The crawler picks up all `.py`, `.sql`, and `.sh` files recursively.
-3. Click **Re-ingest ETL Repo** to rebuild the index.
+You can switch repositories at any time without restarting the app:
 
-The system works best on repos where table aliases are consistent within a script (e.g., `cust_tab` always means `customer`). The LLM entity extractor is prompted to infer these mappings automatically.
+1. Enter the new root path in **ETL Root Folder**.
+2. List any folders to skip in **Excluded Folders**.
+3. Click **Index ETL Files** — the index is rebuilt from scratch for the new path.
+
+`ETL_REPO_PATH` in `.env` sets the default path shown on startup, but it can be overridden live in the sidebar.
+
+The system works best on repos where table aliases are consistent within a script (e.g., `cust_tab` always means `customer`). The LLM entity extractor infers these mappings automatically.
 
 ## Tech Stack
 
