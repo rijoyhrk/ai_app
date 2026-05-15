@@ -200,6 +200,96 @@ You can switch repositories at any time without restarting the app:
 
 The system works best on repos where table aliases are consistent within a script (e.g., `cust_tab` always means `customer`). The LLM entity extractor infers these mappings automatically.
 
+## Secrets Management (Production)
+
+The app supports two API key resolution strategies. **GCP Secret Manager is the recommended production approach** — the raw key never touches disk, `.env`, or any network request outside GCP's IAM-controlled plane.
+
+### How it works
+
+```
+API key resolution order (first match wins):
+  1. GCP Secret Manager  ← production
+  2. ANTHROPIC_API_KEY   ← local dev fallback
+```
+
+`src/config.py` checks whether `GCP_PROJECT_ID` is set at startup. If it is, it calls Secret Manager using **Application Default Credentials (ADC)** — on a GCP VM this is the VM's attached service account, with no credential file or hardcoded key anywhere.
+
+### Setup on GCP
+
+**1. Create the secret**
+
+```bash
+# Create the secret resource
+gcloud secrets create anthropic-api-key \
+  --project=YOUR_PROJECT_ID \
+  --replication-policy="automatic"
+
+# Store your API key as the first version
+echo -n "sk-ant-YOUR_KEY" | \
+  gcloud secrets versions add anthropic-api-key \
+  --project=YOUR_PROJECT_ID \
+  --data-file=-
+```
+
+**2. Grant your VM's service account access**
+
+```bash
+# Find your VM's service account
+gcloud compute instances describe YOUR_VM_NAME \
+  --zone=YOUR_ZONE \
+  --format="value(serviceAccounts[0].email)"
+
+# Grant it read-only access to this secret
+gcloud secrets add-iam-policy-binding anthropic-api-key \
+  --project=YOUR_PROJECT_ID \
+  --member="serviceAccount:YOUR_SA@YOUR_PROJECT.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+**3. Configure `.env`** (no raw key needed)
+
+```env
+GCP_PROJECT_ID=your-gcp-project-id
+GCP_SECRET_NAME=anthropic-api-key
+GCP_SECRET_VERSION=latest   # or pin to a version number, e.g. "3"
+```
+
+The app reads these at startup, fetches the key from Secret Manager, and holds it only in memory for the lifetime of the process.
+
+### Local development fallback
+
+When `GCP_PROJECT_ID` is not set, the app uses `ANTHROPIC_API_KEY` from `.env` directly. This lets developers run locally without needing GCP access:
+
+```env
+# .env (local dev only — this file is gitignored)
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Secret rotation
+
+To rotate the key without downtime:
+
+```bash
+# Add a new version
+echo -n "sk-ant-NEW_KEY" | \
+  gcloud secrets versions add anthropic-api-key \
+  --project=YOUR_PROJECT_ID \
+  --data-file=-
+
+# Restart the app to pick up the new "latest" version
+# Or pin GCP_SECRET_VERSION to the specific version number
+```
+
+### What never happens
+
+| Risk | Status |
+|---|---|
+| API key in source code | Never — not in any file |
+| API key in `.env` (prod) | Never — `.env` only has project ID + secret name |
+| API key in git history | Never — `.env` is gitignored |
+| API key over the network unencrypted | Never — Secret Manager uses TLS + IAM |
+| Broad IAM access | No — service account has only `secretmanager.secretAccessor` on this one secret |
+
 ## Tech Stack
 
 | Component | Library |
@@ -212,10 +302,12 @@ The system works best on repos where table aliases are consistent within a scrip
 | BM25 keyword search | rank-bm25 |
 | Lineage graph | NetworkX + PyVis |
 | Dashboard | Streamlit |
+| Secrets | GCP Secret Manager + ADC |
 | Config | pydantic-settings + python-dotenv |
 
 ## Security Notes
 
-- The dashboard has **no authentication**. Do not expose it on a public IP with a real API key.
-- `.env` and `chroma_db/` are gitignored — never commit your API key.
+- The dashboard has **no authentication**. Do not expose it on a public IP.
+- `.env` and `chroma_db/` are gitignored — never commit secrets.
 - The Streamlit server binds to `localhost` by default (see `.streamlit/config.toml`).
+- In production, the API key lives only in GCP Secret Manager and in-process memory.
