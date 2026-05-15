@@ -128,9 +128,9 @@ On first run, click **Re-ingest ETL Files** in the sidebar to crawl your scripts
 
 ## Using the Dashboard
 
-The sidebar and main panel expose three input fields:
+All three inputs live in the **sidebar**, always visible:
 
-### Input 1 — ETL Root Folder (sidebar)
+### Input 1 — ETL Root Folder
 
 Enter the absolute or relative path to the root of your ETL repository.  
 The crawler walks it recursively and picks up all `.py`, `.sql`, and `.sh` files.
@@ -140,29 +140,31 @@ The crawler walks it recursively and picks up all `.py`, `.sql`, and `.sh` files
 /path/to/your/etl/repo
 ```
 
-### Input 2 — Excluded Folders (sidebar)
+### Input 2 — Excluded Folders *(optional)*
 
-Optionally list folder names to skip during indexing — one per line or comma-separated.  
-Matches any directory at any depth inside the ETL root (e.g. `archive` will skip `/repo/archive/` and `/repo/jobs/archive/`).
+Folder names to skip during crawl — one per line or comma-separated.  
+Matches any directory at any depth (e.g. `archive` skips `/repo/archive/` and `/repo/jobs/archive/`).
 
 ```
-🚫 Excluded Folders
+🚫 Excluded Folders (optional)
 archive
 deprecated
 tests, legacy
 ```
 
-Click **Index ETL Files** to crawl the folder (respecting exclusions), extract entities with Claude, and build the vector index. A status bar shows the active path, excluded folders, and chunk count.
+Click **🔄 Index ETL Files** to crawl the folder (respecting exclusions), extract entities with Claude, and build the vector index.
 
-### Input 3 — Table Name (main panel)
+### Input 3 — Table Name
 
-Type any table name in the search bar and press **Search**.  
-The system expands the query to all known aliases and runs hybrid search + LLM reranking.
+Type any table name and press **Search**.  
+The Search button is enabled only after indexing. The system expands the query to all known aliases automatically.
 
 ```
 🔎 Search Table
-customer
+Table Name:  customer
 ```
+
+The main panel shows a step-by-step guide (`Step 1 → Step 2`) when inputs are pending, and switches to results once a search is run.
 
 ### Results (3 tabs)
 

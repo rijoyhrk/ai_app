@@ -161,37 +161,31 @@ def _op_badge(op: str) -> str:
 
 # ─── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("⚙️ ETL Repository")
+    st.title("⚙️ Configuration")
 
     # ── Input 1: ETL root folder ────────────────────────────────────────────
-    st.markdown("**📁 ETL Root Folder**")
     etl_path = st.text_input(
-        "etl_root",
+        "📁 ETL Root Folder",
         value=st.session_state.etl_path,
         placeholder="/path/to/your/etl/repo",
-        label_visibility="collapsed",
         help="Absolute or relative path to the root of your ETL repository.",
         key="etl_path_input",
     )
     st.session_state.etl_path = etl_path
 
     # ── Input 2: Excluded folders ───────────────────────────────────────────
-    st.markdown("**🚫 Excluded Folders** *(optional)*")
     excluded_raw = st.text_area(
-        "excluded_dirs",
+        "🚫 Excluded Folders (optional)",
         value=st.session_state.excluded_dirs,
-        placeholder="e.g.  archive, deprecated, tests\n(one per line or comma-separated)",
+        placeholder="archive\ndeprecated\ntests, legacy",
         height=90,
-        label_visibility="collapsed",
-        help="Folder names to skip during crawl. Matches any directory at any depth.",
+        help="Folder names to skip during crawl. One per line or comma-separated. Matches any directory at any depth.",
         key="excluded_dirs_input",
     )
     st.session_state.excluded_dirs = excluded_raw
     excluded_list = _parse_excluded(excluded_raw)
     if excluded_list:
         st.caption(f"Will skip: {', '.join(f'`{d}`' for d in excluded_list)}")
-
-    st.markdown("")  # spacing
 
     if st.button("🔄 Index ETL Files", use_container_width=True, type="primary"):
         if not etl_path.strip():
@@ -220,6 +214,32 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Input 3: Table name search ──────────────────────────────────────────
+    st.markdown("### 🔎 Search Table")
+    table_query = st.text_input(
+        "Table Name",
+        placeholder="e.g.  customer   orders   product",
+        help="Enter any table name — including aliases. The system resolves them automatically.",
+        key="query_input",
+    )
+    search_clicked = st.button(
+        "Search",
+        use_container_width=True,
+        disabled=not st.session_state.ingested,
+        help="Index ETL files first, then search for a table name.",
+    )
+
+    if search_clicked and table_query.strip():
+        if not st.session_state.ingested:
+            st.warning("Please index ETL files first.")
+        else:
+            with st.spinner(f"Searching for **{table_query.strip()}**…"):
+                results = _do_search(table_query.strip())
+                st.session_state.results = results
+                st.session_state.query = table_query.strip()
+
+    st.divider()
+
     if st.session_state.ingested and st.session_state.registry:
         registry_ref: AliasRegistry = st.session_state.registry
         st.subheader("📋 Known Tables & Aliases")
@@ -235,7 +255,7 @@ with st.sidebar:
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 st.title("🔍 Data Lineage Discovery Dashboard")
-st.markdown("*Enter a table name below to find every ETL script that references it — including via aliases.*")
+st.markdown("*Use the sidebar to set your ETL folder and search for any table name.*")
 
 if not st.session_state.ingested:
     _load_existing()
@@ -255,34 +275,15 @@ if st.session_state.ingested:
         unsafe_allow_html=True,
     )
 else:
-    st.info("👈 Set the **ETL Root Folder** in the sidebar and click **Index ETL Files** to get started.")
+    st.info("👈 **Step 1:** Set the ETL Root Folder in the sidebar and click **Index ETL Files**.")
     st.stop()
-
-st.markdown("---")
-
-# ─── Input 3: Table name search ───────────────────────────────────────────────
-st.markdown("### 🔎 Search Table")
-col_search, col_btn = st.columns([5, 1])
-with col_search:
-    query = st.text_input(
-        "table_name",
-        placeholder="Enter table name, e.g.  customer   orders   product",
-        label_visibility="collapsed",
-        key="query_input",
-    )
-with col_btn:
-    search_clicked = st.button("Search", use_container_width=True, type="primary")
-
-if search_clicked and query.strip():
-    with st.spinner(f"Searching for **{query.strip()}**…"):
-        results = _do_search(query.strip())
-        st.session_state.results = results
-        st.session_state.query = query.strip()
 
 # ─── Results ──────────────────────────────────────────────────────────────────
 if not st.session_state.results:
     if st.session_state.query:
         st.warning(f"No matching scripts found for **{st.session_state.query}**.")
+    else:
+        st.info("👈 **Step 2:** Enter a table name in the sidebar and click **Search**.")
     st.stop()
 
 results = st.session_state.results
