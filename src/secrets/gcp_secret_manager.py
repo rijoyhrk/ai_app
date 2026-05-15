@@ -11,6 +11,14 @@ or set GOOGLE_APPLICATION_CREDENTIALS to a service-account JSON key file.
 """
 from __future__ import annotations
 
+# Module-level import so tests can patch `src.secrets.gcp_secret_manager.secretmanager`.
+# Gracefully set to None when the library is not installed; fetch_secret raises a
+# clear ImportError in that case rather than at import time.
+try:
+    from google.cloud import secretmanager  # type: ignore
+except ImportError:
+    secretmanager = None  # type: ignore
+
 
 def fetch_secret(project_id: str, secret_name: str, version: str = "latest") -> str:
     """
@@ -28,13 +36,11 @@ def fetch_secret(project_id: str, secret_name: str, version: str = "latest") -> 
         ImportError:   google-cloud-secret-manager is not installed.
         RuntimeError:  Secret could not be fetched (permission denied, not found, etc.).
     """
-    try:
-        from google.cloud import secretmanager  # type: ignore
-    except ImportError as exc:
+    if secretmanager is None:
         raise ImportError(
             "google-cloud-secret-manager is required to use GCP Secret Manager. "
             "Install it with:  pip install google-cloud-secret-manager"
-        ) from exc
+        )
 
     resource = f"projects/{project_id}/secrets/{secret_name}/versions/{version}"
     try:
