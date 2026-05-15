@@ -2,6 +2,9 @@
 
 An intelligent RAG-powered dashboard: enter **any table name** and instantly see every ETL script that references it — even when scripts use aliases like `cust_tab`, `CUST`, or `prod_tbl` instead of the canonical name.
 
+> **Full architecture documentation:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)  
+> Covers component deep-dives, data flow sequence diagrams, security model, deployment guide (local / GCP VM / Docker), configuration reference, and performance characteristics.
+
 ## How It Works
 
 ```
