@@ -1,13 +1,15 @@
 """
 Data Lineage Discovery Dashboard
-RAG-powered unknown entity resolver with semantic alias matching.
+RAG-powered entity resolver: enter any table name → see every script that references it.
 """
 import os
 import sys
 import tempfile
 import streamlit as st
 import anthropic
+import pandas as pd
 from pathlib import Path
+from collections import defaultdict
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,16 +33,21 @@ st.set_page_config(
 st.markdown("""
 <style>
   .result-card {
-      background: #1e1e2e; border-radius: 8px; padding: 14px;
-      margin-bottom: 10px; border-left: 4px solid #7c3aed;
+      background: #1e1e2e; border-radius: 8px; padding: 16px;
+      margin-bottom: 12px; border-left: 4px solid #7c3aed;
   }
   .op-badge {
-      display: inline-block; padding: 2px 8px; border-radius: 12px;
-      font-size: 0.75rem; font-weight: bold; margin-right: 6px;
+      display: inline-block; padding: 2px 10px; border-radius: 12px;
+      font-size: 0.75rem; font-weight: bold; margin-right: 4px;
   }
-  .READ  { background: #1e40af; color: #93c5fd; }
-  .WRITE { background: #7f1d1d; color: #fca5a5; }
+  .READ   { background: #1e40af; color: #93c5fd; }
+  .WRITE  { background: #7f1d1d; color: #fca5a5; }
   .CREATE { background: #713f12; color: #fde68a; }
+  .UNKNOWN{ background: #374151; color: #d1d5db; }
+  .summary-box {
+      background: #12122a; border-radius: 10px; padding: 18px 22px;
+      margin-bottom: 18px; border: 1px solid #7c3aed33;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -62,7 +69,6 @@ def get_anthropic_client():
 
 
 def _load_existing() -> bool:
-    """Try loading an already-ingested store + registry."""
     try:
         store = VectorStore(settings.chroma_persist_dir)
         registry = AliasRegistry.load(settings.alias_registry_path)
@@ -83,15 +89,15 @@ def _do_search(query: str) -> list:
 
     if st.session_state.engine is None:
         engine = HybridSearchEngine(store, registry)
-        # build BM25 from stored collection (sample 200 docs)
         raw = store._collection.get(limit=200, include=["documents", "metadatas"])
-        bm25_docs = []
-        for i, doc_id in enumerate(raw.get("ids", [])):
-            bm25_docs.append({
+        bm25_docs = [
+            {
                 "chunk_id": doc_id,
                 "embedding_text": raw["documents"][i] if raw.get("documents") else "",
                 "metadata": raw["metadatas"][i] if raw.get("metadatas") else {},
-            })
+            }
+            for i, doc_id in enumerate(raw.get("ids", []))
+        ]
         engine.build_bm25_index(bm25_docs)
         st.session_state.engine = engine
 
@@ -101,13 +107,59 @@ def _do_search(query: str) -> list:
     return ranked
 
 
+def _group_by_file(results: list) -> dict:
+    """
+    Collapse chunk-level results into file-level groups.
+    Each group keeps the highest-scoring chunk per operation type.
+    Returns: {file_path: {ops, best_score, aliases_used, matched_via, chunks}}
+    """
+    groups: dict = defaultdict(lambda: {
+        "ops": set(),
+        "best_score": 0.0,
+        "aliases_used": set(),
+        "matched_via": "direct",
+        "chunks": [],
+        "file_type": "",
+        "file_name": "",
+    })
+
+    for r in results:
+        meta = r.get("metadata", {})
+        fp = meta.get("file_path", "unknown")
+        g = groups[fp]
+        g["file_name"] = Path(fp).name
+        g["file_type"] = meta.get("file_type", "")
+        g["chunks"].append(r)
+        op = r.get("operation", "UNKNOWN")
+        g["ops"].add(op)
+        score = r.get("final_score", 0.0)
+        if score > g["best_score"]:
+            g["best_score"] = score
+        if r.get("matched_via") == "alias":
+            g["matched_via"] = "alias"
+        raw_aliases = meta.get("aliases_used", "")
+        if raw_aliases:
+            g["aliases_used"].update(a.strip() for a in raw_aliases.split("|") if a.strip())
+
+    # sort chunks within each file by line_start
+    for fp, g in groups.items():
+        g["chunks"].sort(key=lambda r: r.get("metadata", {}).get("line_start", 0))
+
+    return dict(sorted(groups.items(), key=lambda x: x[1]["best_score"], reverse=True))
+
+
+def _op_badge(op: str) -> str:
+    cls = op if op in ("READ", "WRITE", "CREATE") else "UNKNOWN"
+    return f'<span class="op-badge {cls}">{op}</span>'
+
+
 # ─── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚙️ Configuration")
 
     etl_path = st.text_input("ETL Repo Path", value=settings.etl_repo_path)
     if st.button("🔄 Re-ingest ETL Files", use_container_width=True):
-        with st.spinner("Ingesting ETL files..."):
+        with st.spinner("Ingesting ETL files — this may take a minute…"):
             client = get_anthropic_client()
             store, registry = run_ingestion(
                 repo_path=etl_path,
@@ -124,23 +176,23 @@ with st.sidebar:
         st.success(f"Ingested {store.count()} chunks!")
 
     st.divider()
+
     if st.session_state.ingested and st.session_state.registry:
         registry: AliasRegistry = st.session_state.registry
-        st.subheader("📋 Alias Registry")
+        st.subheader("📋 Known Tables & Aliases")
         canonicals = registry.all_canonicals()
         if canonicals:
-            for c in canonicals[:20]:
+            for c in sorted(canonicals)[:30]:
                 aliases = [a for a in registry.get_all_aliases(c) if a != c]
-                tooltip = f"aliases: {', '.join(aliases)}" if aliases else "no aliases"
-                st.markdown(f"**{c}** — _{tooltip}_")
+                tooltip = f"→ {', '.join(aliases)}" if aliases else ""
+                st.markdown(f"**`{c}`** {tooltip}")
         else:
             st.info("No tables indexed yet.")
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 st.title("🔍 Data Lineage Discovery Dashboard")
-st.markdown("*RAG-powered entity resolver · semantic alias matching · hybrid search*")
+st.markdown("*Enter any table name — find every script that references it, even via aliases.*")
 
-# auto-load if available
 if not st.session_state.ingested:
     _load_existing()
 
@@ -148,97 +200,146 @@ if not st.session_state.ingested:
     st.info("👈 Click **Re-ingest ETL Files** in the sidebar to index your ETL repository.")
     st.stop()
 
-st.success(f"✅ {st.session_state.store.count()} chunks indexed")
+# ─── Search bar ───────────────────────────────────────────────────────────────
+st.markdown(f"**{st.session_state.store.count()} chunks indexed** across your ETL repo.")
 
 col_search, col_btn = st.columns([5, 1])
 with col_search:
     query = st.text_input(
-        "Search for a table / entity",
-        placeholder='e.g. "customer" or "cust_tab"',
+        "Table name",
+        placeholder='e.g.  customer   or   orders   or   cust_tab',
+        label_visibility="collapsed",
         key="query_input",
     )
 with col_btn:
-    st.markdown("<br>", unsafe_allow_html=True)
-    search_clicked = st.button("Search", use_container_width=True, type="primary")
+    search_clicked = st.button("🔍 Search", use_container_width=True, type="primary")
 
-if search_clicked and query:
-    with st.spinner(f"Searching for '{query}'..."):
-        results = _do_search(query)
+if search_clicked and query.strip():
+    with st.spinner(f"Searching for **{query.strip()}**…"):
+        results = _do_search(query.strip())
         st.session_state.results = results
-        st.session_state.query = query
+        st.session_state.query = query.strip()
 
 # ─── Results ──────────────────────────────────────────────────────────────────
-if st.session_state.results:
-    results = st.session_state.results
-    q = st.session_state.query
-    registry: AliasRegistry = st.session_state.registry
-    canonical = registry.resolve(q)
-    aliases = [a for a in registry.get_all_aliases(canonical) if a != canonical]
+if not st.session_state.results:
+    st.stop()
 
-    st.subheader(f"Results for '{q}'")
-    if aliases:
-        st.caption(f"Resolved to canonical: **{canonical}** · known aliases: {', '.join(aliases)}")
+results = st.session_state.results
+q = st.session_state.query
+registry: AliasRegistry = st.session_state.registry
+canonical = registry.resolve(q)
+aliases = [a for a in registry.get_all_aliases(canonical) if a != canonical]
+file_groups = _group_by_file(results)
+n_files = len(file_groups)
 
-    tabs = st.tabs(["📄 File References", "🕸️ Lineage Graph"])
-
-    # ── Tab 1: Results list ──────────────────────────────────────────────────
-    with tabs[0]:
-        if not results:
-            st.warning("No matching scripts found.")
-        else:
-            st.markdown(f"**{len(results)} script(s)** reference `{canonical}`:")
-            for r in results:
-                meta = r.get("metadata", {})
-                file_name = Path(meta.get("file_path", "unknown")).name
-                file_path = meta.get("file_path", "")
-                op = r.get("operation", "UNKNOWN")
-                score = r.get("final_score", 0)
-                lines = f"{meta.get('line_start','?')}-{meta.get('line_end','?')}"
-                explanation = r.get("explanation", "")
-                matched_via = r.get("matched_via", "direct")
-                aliases_used = meta.get("aliases_used", "")
-
-                op_class = op if op in ("READ", "WRITE", "CREATE") else "READ"
-                with st.container():
-                    st.markdown(f"""
-<div class="result-card">
-  <b>{file_name}</b>&nbsp;
-  <span class="op-badge {op_class}">{op}</span>
-  <span style="color:#888; font-size:0.8rem;">lines {lines} · score {score:.2f}</span>
-  {"<br><i style='color:#a78bfa; font-size:0.85rem;'>via alias: " + aliases_used + "</i>" if matched_via == "alias" and aliases_used else ""}
-  <br><span style='color:#ccc; font-size:0.9rem;'>{explanation}</span>
-  <br><code style='font-size:0.75rem; color:#888;'>{file_path}</code>
+# ── Summary banner ────────────────────────────────────────────────────────────
+alias_note = f" (also known as: **{', '.join(aliases)}**)" if aliases else ""
+st.markdown(f"""
+<div class="summary-box">
+  <h3 style="margin:0 0 6px 0;">Table: <code>{canonical}</code>{alias_note if not aliases else ""}</h3>
+  {"<p style='margin:4px 0; color:#a78bfa;'>Also known as: <b>" + ", ".join(f"<code>{a}</code>" for a in aliases) + "</b></p>" if aliases else ""}
+  <p style="margin:6px 0 0 0; font-size:1.1rem;">
+    Found in <b>{n_files} script{"s" if n_files != 1 else ""}</b>
+  </p>
 </div>
 """, unsafe_allow_html=True)
 
-                    with st.expander("View code excerpt"):
-                        emb = r.get("embedding_text", "")
-                        code = emb.split("[ENTITIES]")[0].replace("[CODE]", "").strip()
-                        ft = meta.get("file_type", "text")
-                        lang = {"python": "python", "sql": "sql", "shell": "bash"}.get(ft, "text")
-                        st.code(code[:2000], language=lang)
+tabs = st.tabs(["📋 Summary Table", "📄 Script Details", "🕸️ Lineage Graph"])
 
-    # ── Tab 2: Lineage Graph ─────────────────────────────────────────────────
-    with tabs[1]:
-        graph = LineageGraph()
-        graph.build_from_results(results, registry)
-        G = graph.get_graph()
+# ── Tab 1: Summary table ──────────────────────────────────────────────────────
+with tabs[0]:
+    rows = []
+    for fp, g in file_groups.items():
+        ops_str = " + ".join(sorted(g["ops"]))
+        aliases_str = ", ".join(sorted(g["aliases_used"])) if g["aliases_used"] else "—"
+        match_type = "alias" if g["matched_via"] == "alias" else "direct"
+        rows.append({
+            "Script": g["file_name"],
+            "Operations": ops_str,
+            "Matched Via": match_type,
+            "Aliases Used": aliases_str,
+            "Relevance Score": round(g["best_score"], 3),
+            "Full Path": fp,
+        })
 
-        if G.number_of_nodes() == 0:
-            st.warning("No graph data to display.")
-        else:
-            summary = graph.get_lineage_summary(canonical)
-            if summary:
-                for op_type, files in summary.items():
-                    emoji = {"READ": "📖", "WRITE": "✍️", "CREATE": "🏗️"}.get(op_type, "🔗")
-                    st.markdown(f"**{emoji} {op_type}**")
+    df = pd.DataFrame(rows)
+
+    st.markdown(f"**`{canonical}` is referenced in the following {n_files} script(s):**")
+    st.dataframe(
+        df[["Script", "Operations", "Matched Via", "Aliases Used", "Relevance Score"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # Download button
+    csv = df.to_csv(index=False)
+    st.download_button(
+        label="⬇️ Download as CSV",
+        data=csv,
+        file_name=f"lineage_{canonical}.csv",
+        mime="text/csv",
+    )
+
+# ── Tab 2: Per-file detail cards ─────────────────────────────────────────────
+with tabs[1]:
+    for fp, g in file_groups.items():
+        file_name = g["file_name"]
+        ops_html = " ".join(_op_badge(op) for op in sorted(g["ops"]))
+        alias_html = (
+            f"<br><span style='color:#a78bfa; font-size:0.85rem;'>via alias: "
+            f"<b>{', '.join(sorted(g['aliases_used']))}</b></span>"
+            if g["aliases_used"] else ""
+        )
+        score_str = f"{g['best_score']:.3f}"
+        n_chunks = len(g["chunks"])
+
+        st.markdown(f"""
+<div class="result-card">
+  <b style="font-size:1.05rem;">{file_name}</b>&nbsp;&nbsp;
+  {ops_html}
+  <span style="color:#888; font-size:0.8rem; float:right;">score {score_str}</span>
+  {alias_html}
+  <br><code style="color:#666; font-size:0.75rem;">{fp}</code>
+</div>
+""", unsafe_allow_html=True)
+
+        for chunk in g["chunks"]:
+            meta = chunk.get("metadata", {})
+            chunk_op = chunk.get("operation", "UNKNOWN")
+            lines = f"lines {meta.get('line_start','?')}–{meta.get('line_end','?')}"
+            explanation = chunk.get("explanation", "")
+            emb = chunk.get("embedding_text", "")
+            code = emb.split("[ENTITIES]")[0].replace("[CODE]", "").strip()
+            ft = meta.get("file_type", "text")
+            lang = {"python": "python", "sql": "sql", "shell": "bash"}.get(ft, "text")
+
+            with st.expander(f"{_op_badge(chunk_op)} {lines}  —  {explanation[:90]}", expanded=False):
+                st.code(code[:2000], language=lang)
+
+        st.markdown("---")
+
+# ── Tab 3: Lineage Graph ──────────────────────────────────────────────────────
+with tabs[2]:
+    graph = LineageGraph()
+    graph.build_from_results(results, registry)
+    G = graph.get_graph()
+
+    if G.number_of_nodes() == 0:
+        st.warning("No graph data to display.")
+    else:
+        summary = graph.get_lineage_summary(canonical)
+        if summary:
+            cols = st.columns(len(summary))
+            emoji_map = {"READ": "📖", "WRITE": "✍️", "CREATE": "🏗️", "OTHER": "🔗"}
+            for col, (op_type, files) in zip(cols, summary.items()):
+                with col:
+                    st.markdown(f"**{emoji_map.get(op_type, '🔗')} {op_type}**")
                     for f in files:
-                        st.markdown(f"  - `{f}`")
+                        st.markdown(f"- `{f}`")
 
-            # render pyvis graph
-            with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
-                html_path = tmp.name
-            graph.to_pyvis_html(html_path, title=f"Lineage: {canonical}")
-            if Path(html_path).exists():
-                html_content = Path(html_path).read_text()
-                st.components.v1.html(html_content, height=620, scrolling=True)
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
+            html_path = tmp.name
+        graph.to_pyvis_html(html_path, title=f"Lineage: {canonical}")
+        if Path(html_path).exists():
+            html_content = Path(html_path).read_text()
+            st.components.v1.html(html_content, height=620, scrolling=True)

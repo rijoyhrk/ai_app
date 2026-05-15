@@ -1,6 +1,6 @@
 # Data Lineage Discovery Dashboard
 
-An intelligent RAG-powered dashboard that traces any table name through your ETL codebase — including scripts that reference it via aliases like `cust_tab`, `CUST`, or `prod_tbl`.
+An intelligent RAG-powered dashboard: enter **any table name** and instantly see every ETL script that references it — even when scripts use aliases like `cust_tab`, `CUST`, or `prod_tbl` instead of the canonical name.
 
 ## How It Works
 
@@ -20,7 +20,10 @@ User query: "customer"
   Lineage Graph (NetworkX DiGraph → PyVis interactive HTML)
        │
        ▼
-  Dashboard results: which scripts touch "customer", in what direction
+  Dashboard (3 tabs):
+    ├── Summary Table  — one row per script, with operations + aliases used + CSV download
+    ├── Script Details — expandable per-chunk code excerpts with operation badges
+    └── Lineage Graph  — interactive directed graph (table ↔ scripts)
 ```
 
 ## Architecture
@@ -113,19 +116,29 @@ streamlit run app.py
 
 Then open `http://localhost:8501` in your browser.
 
-On first run, click **Re-ingest ETL Repo** in the sidebar to crawl your scripts, extract entities, and build the vector index.
+On first run, click **Re-ingest ETL Files** in the sidebar to crawl your scripts, extract entities, and build the vector index.
+
+## Using the Dashboard
+
+1. **Type any table name** in the search bar (e.g. `customer`, `orders`, `prod_tbl`) and press **Search**.
+2. The **Summary Table** tab shows a deduplicated list of every script that references the table, the operation type (READ / WRITE / CREATE), and which alias was matched.
+3. The **Script Details** tab shows each matching script as a card with expandable code excerpts per chunk.
+4. The **Lineage Graph** tab renders an interactive directed graph — arrows show whether a script reads from or writes to the table.
+5. Use the **⬇️ Download as CSV** button in the Summary Table to export the results.
 
 ## Example: Alias Resolution in Action
 
-Querying `customer` finds all five sample scripts, even though none of them use the exact word "customer" in every reference:
+Querying `customer` finds all five sample scripts. The **Summary Table** output looks like:
 
-| Script | Aliases used | Operation |
-|---|---|---|
-| `customer_data_pipeline.py` | `cust_tab` | READ + WRITE |
-| `customer_transformation.sql` | `CUST`, `customer_staging` | WRITE (MERGE) |
-| `load_customers.sh` | `customer_staging`, `cust_tab` | WRITE (COPY) |
-| `orders_pipeline.py` | `cust_data` | READ |
-| `product_sync.sql` | `CUSTOMER` | READ |
+| Script | Operations | Matched Via | Aliases Used | Relevance Score |
+|---|---|---|---|---|
+| `customer_data_pipeline.py` | READ + WRITE | alias | `cust_tab` | 0.91 |
+| `customer_transformation.sql` | WRITE | alias | `CUST`, `customer_staging` | 0.88 |
+| `load_customers.sh` | WRITE | alias | `customer_staging`, `cust_tab` | 0.85 |
+| `orders_pipeline.py` | READ | alias | `cust_data` | 0.79 |
+| `product_sync.sql` | READ | alias | `CUSTOMER` | 0.74 |
+
+None of these scripts use the exact word `customer` everywhere — alias resolution bridges the gap automatically.
 
 ## Using Your Own ETL Repository
 
