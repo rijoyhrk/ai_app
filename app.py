@@ -228,13 +228,23 @@ with st.sidebar:
     if excluded_list:
         st.caption(f"Will skip: {', '.join(f'`{d}`' for d in excluded_list)}")
 
+    skip_llm = st.toggle(
+        "⚡ Skip LLM entity extraction",
+        value=st.session_state.get("skip_llm_ingest", False),
+        help="Use regex-based extraction instead of Claude. No API credits needed. "
+             "Finds exact table names but cannot resolve aliases (cust_tab → customer).",
+        key="skip_llm_toggle",
+    )
+    st.session_state.skip_llm_ingest = skip_llm
+
     if st.button("🔄 Index ETL Files", use_container_width=True, type="primary"):
         if not etl_path.strip():
             st.error("Please enter an ETL root folder path.")
         elif not Path(etl_path.strip()).exists():
             st.error(f"Path not found: `{etl_path.strip()}`")
         else:
-            with st.spinner("Indexing ETL files — this may take a minute…"):
+            label = "Indexing (offline mode)…" if skip_llm else "Indexing ETL files — this may take a minute…"
+            with st.spinner(label):
                 client = get_anthropic_client()
                 store, registry = run_ingestion(
                     repo_path=etl_path.strip(),
@@ -243,6 +253,7 @@ with st.sidebar:
                     anthropic_client=client,
                     llm_model=settings.llm_model,
                     excluded_dirs=excluded_list or None,
+                    skip_llm=skip_llm,
                     verbose=False,
                 )
                 st.session_state.store = store
@@ -251,6 +262,7 @@ with st.sidebar:
                 st.session_state.ingested = True
                 st.session_state.indexed_path = etl_path.strip()
                 st.session_state.indexed_excluded = excluded_list
+                st.session_state.indexed_skip_llm = skip_llm
             st.success(f"Indexed {store.count()} chunks!")
 
     st.divider()
@@ -313,14 +325,16 @@ if not st.session_state.ingested:
 if st.session_state.ingested:
     idx_path = st.session_state.get("indexed_path") or st.session_state.etl_path
     idx_excl = st.session_state.get("indexed_excluded") or []
+    idx_offline = st.session_state.get("indexed_skip_llm", False)
     excl_html = (
         "  ·  Excluded: " + " ".join(f'<span class="config-pill">{d}</span>' for d in idx_excl)
         if idx_excl else ""
     )
+    mode_html = '  ·  <span class="config-pill">⚡ offline mode</span>' if idx_offline else ""
     st.markdown(
         f'<p style="font-size:0.88rem; color:#888;">Indexed: '
         f'<code style="color:#a78bfa">{idx_path}</code>'
-        f'{excl_html} &nbsp;·&nbsp; {st.session_state.store.count()} chunks</p>',
+        f'{excl_html}{mode_html} &nbsp;·&nbsp; {st.session_state.store.count()} chunks</p>',
         unsafe_allow_html=True,
     )
 else:

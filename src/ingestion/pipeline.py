@@ -1,8 +1,8 @@
 """
 Full ingestion pipeline:
   1. Crawl ETL files → AST-aware chunks
-  2. LLM entity extraction + alias registry
-  3. Enriched document building
+  2. Entity extraction (LLM or rule-based fallback)
+  3. Alias registry build
   4. ChromaDB upsert
 """
 import anthropic
@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional, List
 from src.chunkers.dispatcher import crawl_and_chunk
 from src.extractors.entity_extractor import batch_extract_entities
+from src.extractors.rule_based_extractor import batch_extract_entities_rule_based
 from src.extractors.alias_registry import AliasRegistry
 from src.ingestion.document_builder import build_enriched_documents
 from src.ingestion.vector_store import VectorStore
@@ -22,11 +23,15 @@ def run_ingestion(
     anthropic_client: anthropic.Anthropic,
     llm_model: str = "claude-opus-4-7",
     excluded_dirs: Optional[list] = None,
+    skip_llm: bool = False,
     verbose: bool = True,
 ) -> tuple[VectorStore, AliasRegistry]:
     """
     Full ingestion pipeline. Returns the vector store and alias registry.
-    excluded_dirs: list of directory names to skip during crawl.
+
+    skip_llm=True uses regex-based entity extraction instead of Claude.
+    No API calls are made in that mode — alias resolution is unavailable
+    but exact table name search still works.
     """
     log = print if verbose else lambda *a, **k: None
 
@@ -39,13 +44,21 @@ def run_ingestion(
 
     if not chunks:
         log("      No files found. Check ETL_REPO_PATH.")
-        registry = AliasRegistry()
-        store = VectorStore(chroma_persist_dir)
-        return store, registry
+        return VectorStore(chroma_persist_dir), AliasRegistry()
 
-    # Step 2: LLM entity extraction
-    log(f"[2/4] Extracting entities with LLM ({llm_model})...")
-    all_entities = batch_extract_entities(anthropic_client, chunks, model=llm_model)
+    # Step 2: entity extraction
+    if skip_llm:
+        log("[2/4] Extracting entities with rule-based extractor (LLM skipped)...")
+        all_entities = batch_extract_entities_rule_based(chunks)
+    else:
+        log(f"[2/4] Extracting entities with LLM ({llm_model})...")
+        try:
+            all_entities = batch_extract_entities(anthropic_client, chunks, model=llm_model)
+        except (anthropic.BadRequestError, anthropic.APIStatusError,
+                anthropic.APIConnectionError, anthropic.RateLimitError) as e:
+            log(f"      API unavailable ({e}). Falling back to rule-based extraction.")
+            all_entities = batch_extract_entities_rule_based(chunks)
+            skip_llm = True   # propagate so caller knows
     log(f"      Processed {len(all_entities)} chunks")
 
     # Step 3: build alias registry
