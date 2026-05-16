@@ -72,6 +72,7 @@ def run_ingestion(
     log("[4/4] Building enriched documents and upserting into ChromaDB...")
     docs = build_enriched_documents(chunks, all_entities)
     store = VectorStore(chroma_persist_dir)
+    store.reset()          # clear stale chunks from previous runs before re-indexing
     store.upsert(docs)
     log(f"      Vector store now contains {store.count()} chunks")
 
