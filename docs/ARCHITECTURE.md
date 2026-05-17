@@ -571,8 +571,8 @@ graph LR
 
 ```bash
 # 1. Clone
-git clone https://github.com/rijoyhrk/ai_app.git
-cd ai_app
+git clone https://github.com/rijoyhrk/data-lineage-rag.git
+cd data-lineage-rag
 
 # 2. Create isolated Python environment
 python3 -m venv .venv
@@ -599,8 +599,8 @@ streamlit run app.py
 sudo apt-get update && sudo apt-get install -y python3.11 python3.11-venv git
 
 # 2. Clone
-git clone https://github.com/rijoyhrk/ai_app.git
-cd ai_app
+git clone https://github.com/rijoyhrk/data-lineage-rag.git
+cd data-lineage-rag
 
 # 3. Virtual environment
 python3.11 -m venv .venv
