@@ -58,7 +58,7 @@ The system is built in six layers:
 ## Project Structure
 
 ```
-ai_app/
+data-lineage-rag/
 ├── app.py                          # Streamlit dashboard entry point
 ├── requirements.txt
 ├── .env.example                    # Copy to .env and add your API key
@@ -101,8 +101,8 @@ ai_app/
 ### Installation
 
 ```bash
-git clone https://github.com/rijoyhrk/ai_app.git
-cd ai_app
+git clone https://github.com/rijoyhrk/data-lineage-rag.git
+cd data-lineage-rag
 pip install -r requirements.txt
 ```
 
