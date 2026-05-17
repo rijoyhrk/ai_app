@@ -1,0 +1,13 @@
+.env
+.venv/
+venv/
+chroma_db/
+lib/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.streamlit/config.toml
