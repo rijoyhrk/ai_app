@@ -1,5 +1,10 @@
 # Data Lineage Discovery Dashboard
 
+![Python](https://img.shields.io/badge/Python-3.11-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Tests](https://img.shields.io/badge/Tests-145%20passing-brightgreen)
+![LLM](https://img.shields.io/badge/LLM-Claude%20claude--opus--4--7-orange)
+
 An intelligent RAG-powered dashboard: enter **any table name** and instantly see every ETL script that references it — even when scripts use aliases like `cust_tab`, `CUST`, or `prod_tbl` instead of the canonical name.
 
 > **Full architecture documentation:** [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)  
@@ -313,4 +318,8 @@ echo -n "sk-ant-NEW_KEY" | \
 - The dashboard has **no authentication**. Do not expose it on a public IP.
 - `.env` and `chroma_db/` are gitignored — never commit secrets.
 - The Streamlit server binds to `localhost` by default (see `.streamlit/config.toml`).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 - In production, the API key lives only in GCP Secret Manager and in-process memory.

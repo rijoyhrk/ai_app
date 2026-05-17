@@ -82,7 +82,7 @@ graph TB
 
     subgraph External["☁️ External Services"]
         CLAUDE["Anthropic Claude API\nclaude-opus-4-7\nEntity extraction + Reranking"]
-        GCPSM["GCP Secret Manager\nanthropix-api-key secret"]
+        GCPSM["GCP Secret Manager\nanthropic-api-key secret"]
     end
 
     I1 & I2 --> CRAWL
@@ -490,7 +490,7 @@ graph LR
     end
 
     subgraph Prod["🏭 Production (GCP VM)"]
-        P1["GCP Secret Manager\nanthropix-api-key"]
+        P1["GCP Secret Manager\nanthropic-api-key"]
         P2["VM Service Account\nroles/secretmanager.secretAccessor\non this secret only"]
         P3["ADC Metadata Server\n169.254.169.254"]
         P4["src/secrets/\ngcp_secret_manager.py"]
