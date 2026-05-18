@@ -80,16 +80,17 @@ class VectorStore:
         )
 
         # Bulk insert in batches to avoid memory spikes
+        # Use explicit None checks — or[] and if x: both raise ValueError on numpy arrays
         batch_size = 500
-        embs = data.get("embeddings") or []
-        docs = data.get("documents") or []
-        metas = data.get("metadatas") or []
+        embs  = data.get("embeddings")  # numpy array or None
+        docs  = data.get("documents")   # list or None
+        metas = data.get("metadatas")   # list or None
         for i in range(0, len(ids), batch_size):
             new_col.upsert(
                 ids=ids[i:i + batch_size],
-                documents=docs[i:i + batch_size] if docs else None,
-                metadatas=metas[i:i + batch_size] if metas else None,
-                embeddings=embs[i:i + batch_size] if embs else None,
+                documents=docs[i:i + batch_size]  if docs  is not None else None,
+                metadatas=metas[i:i + batch_size] if metas is not None else None,
+                embeddings=embs[i:i + batch_size] if embs  is not None else None,
             )
 
         self._collection = new_col
