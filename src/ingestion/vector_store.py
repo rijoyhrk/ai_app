@@ -1,30 +1,24 @@
+import json
 import anthropic
 import chromadb
 from chromadb.config import Settings
 from typing import List, Dict, Any, Optional
-from .document_builder import EnrichedDocument
-
-
-def _get_embedding(client: anthropic.Anthropic, text: str, model: str) -> List[float]:
-    """
-    Generate an embedding for text.
-    Claude API does not expose a direct embedding endpoint — we use the
-    messages API with a structured extraction approach via a lightweight
-    sentence-transformer fallback using chromadb's default embedding fn.
-    ChromaDB by default uses sentence-transformers/all-MiniLM-L6-v2 locally.
-    """
-    # ChromaDB handles embedding internally via its default embedding function.
-    # We return None here and let ChromaDB embed for us.
-    return None
+from .document_builder import EnrichedDocument, parse_meta_list
 
 
 class VectorStore:
     """
     ChromaDB-backed vector store for enriched ETL code chunks.
-    Uses ChromaDB's built-in sentence-transformer embeddings (local, no API cost).
+
+    Safe re-indexing via staging collection:
+      1. store.reset()  — creates a staging collection; old data in COLLECTION stays intact
+      2. store.upsert() — writes to staging
+      3. store.commit() — atomically promotes staging → COLLECTION, then deletes staging
+    If upsert crashes, commit() is never called and the old COLLECTION is preserved.
     """
 
     COLLECTION = "etl_lineage"
+    _STAGING = "etl_lineage_staging"
 
     def __init__(self, persist_dir: str):
         self._client = chromadb.PersistentClient(
@@ -35,14 +29,77 @@ class VectorStore:
             name=self.COLLECTION,
             metadata={"hnsw:space": "cosine"},
         )
+        self._staging: Optional[Any] = None
+        # Clean up any leftover staging from a previous crashed run
+        try:
+            self._client.delete_collection(self._STAGING)
+        except Exception:
+            pass
+
+    def reset(self) -> None:
+        """Prepare staging collection. Old COLLECTION data is preserved until commit()."""
+        try:
+            self._client.delete_collection(self._STAGING)
+        except Exception:
+            pass
+        self._staging = self._client.create_collection(
+            name=self._STAGING,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     def upsert(self, docs: List[EnrichedDocument]) -> None:
+        """Write to staging (if reset() was called) or directly to main collection."""
         if not docs:
             return
+        target = getattr(self, "_staging", None) or self._collection
         ids = [d.chunk_id for d in docs]
         texts = [d.embedding_text for d in docs]
         metadatas = [d.metadata for d in docs]
-        self._collection.upsert(ids=ids, documents=texts, metadatas=metadatas)
+        target.upsert(ids=ids, documents=texts, metadatas=metadatas)
+
+    def commit(self) -> None:
+        """
+        Promote staging → main collection. Copies embeddings so re-embedding is skipped.
+        No-op if reset() was not called (direct-upsert mode used by tests).
+        """
+        if getattr(self, "_staging", None) is None:
+            return
+
+        # Pull everything from staging (pre-computed embeddings included)
+        data = self._staging.get(include=["documents", "metadatas", "embeddings"])
+        ids = data.get("ids", [])
+
+        # Delete old main and recreate
+        try:
+            self._client.delete_collection(self.COLLECTION)
+        except Exception:
+            pass
+        new_col = self._client.create_collection(
+            name=self.COLLECTION,
+            metadata={"hnsw:space": "cosine"},
+        )
+
+        # Bulk insert in batches to avoid memory spikes
+        batch_size = 500
+        embs = data.get("embeddings") or []
+        docs = data.get("documents") or []
+        metas = data.get("metadatas") or []
+        for i in range(0, len(ids), batch_size):
+            new_col.upsert(
+                ids=ids[i:i + batch_size],
+                documents=docs[i:i + batch_size] if docs else None,
+                metadatas=metas[i:i + batch_size] if metas else None,
+                embeddings=embs[i:i + batch_size] if embs else None,
+            )
+
+        self._collection = new_col
+
+        # Clean up staging
+        try:
+            self._client.delete_collection(self._STAGING)
+        except Exception:
+            pass
+        self._staging = None
 
     def query_semantic(
         self,
@@ -80,7 +137,6 @@ class VectorStore:
                 where={"canonical_tables": {"$contains": canonical_table}},
             )
         except Exception:
-            # fallback: pure semantic if metadata filter fails
             result = self._collection.query(
                 query_texts=[canonical_table],
                 n_results=n_results,
@@ -93,9 +149,9 @@ class VectorStore:
         dists = result.get("distances", [[]])[0]
         for i, chunk_id in enumerate(ids):
             meta = metas[i] if i < len(metas) else {}
-            # post-filter: only keep chunks that actually mention the table
-            tables_str = meta.get("canonical_tables", "")
-            if canonical_table not in tables_str:
+            # Parse JSON or legacy pipe-delimited canonical_tables and exact-match filter
+            tables_list = parse_meta_list(meta.get("canonical_tables", "[]"))
+            if canonical_table not in tables_list:
                 continue
             hits.append({
                 "chunk_id": chunk_id,
@@ -108,10 +164,3 @@ class VectorStore:
 
     def count(self) -> int:
         return self._collection.count()
-
-    def reset(self) -> None:
-        self._client.delete_collection(self.COLLECTION)
-        self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION,
-            metadata={"hnsw:space": "cosine"},
-        )

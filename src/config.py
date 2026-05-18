@@ -5,12 +5,16 @@ API key resolution order (first match wins):
   1. GCP Secret Manager  — when GCP_PROJECT_ID + GCP_SECRET_NAME are set
   2. ANTHROPIC_API_KEY   — env var / .env file (local dev fallback)
 
-All other settings are read from environment / .env as usual.
+If GCP Secret Manager is unreachable (timeout, permission denied, network error),
+a warning is logged and the app falls back to ANTHROPIC_API_KEY automatically.
 """
 from __future__ import annotations
 
+import logging
 from pydantic_settings import BaseSettings
 from pydantic import Field, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 class Settings(BaseSettings):
@@ -30,20 +34,35 @@ class Settings(BaseSettings):
     llm_model: str = Field("claude-opus-4-7", env="LLM_MODEL")
     collection_name: str = "etl_lineage"
 
+    # ── Ingestion settings ────────────────────────────────────────────────────
+    # Number of parallel threads for LLM entity extraction
+    max_extraction_workers: int = Field(8, env="MAX_EXTRACTION_WORKERS")
+
+    # ── Hybrid search weight tuning ───────────────────────────────────────────
+    hybrid_semantic_weight: float = Field(0.6, env="HYBRID_SEMANTIC_WEIGHT")
+    hybrid_bm25_weight: float = Field(0.25, env="HYBRID_BM25_WEIGHT")
+    hybrid_metadata_weight: float = Field(0.15, env="HYBRID_METADATA_WEIGHT")
+
     @model_validator(mode="after")
     def resolve_api_key(self) -> "Settings":
         """
-        If GCP_PROJECT_ID is configured, fetch the API key from Secret Manager.
-        Falls back to ANTHROPIC_API_KEY env var for local development.
-        Raises ValueError at startup if no key can be resolved.
+        If GCP_PROJECT_ID is set, try fetching the key from Secret Manager.
+        On any GCP failure, log a warning and fall through to ANTHROPIC_API_KEY.
+        Raises ValueError only if no key can be resolved at all.
         """
         if self.gcp_project_id:
-            from src.secrets.gcp_secret_manager import fetch_secret
-            self.anthropic_api_key = fetch_secret(
-                project_id=self.gcp_project_id,
-                secret_name=self.gcp_secret_name,
-                version=self.gcp_secret_version,
-            )
+            try:
+                from src.secrets.gcp_secret_manager import fetch_secret
+                self.anthropic_api_key = fetch_secret(
+                    project_id=self.gcp_project_id,
+                    secret_name=self.gcp_secret_name,
+                    version=self.gcp_secret_version,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "GCP Secret Manager unavailable (%s); falling back to ANTHROPIC_API_KEY.",
+                    exc,
+                )
 
         if not self.anthropic_api_key:
             raise ValueError(

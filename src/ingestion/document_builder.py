@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 from src.chunkers.base import CodeChunk
@@ -21,6 +22,23 @@ class EnrichedDocument:
     embedding_text: str
     # full metadata for ChromaDB
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+def parse_meta_list(value) -> List[str]:
+    """
+    Parse a ChromaDB metadata list field.
+    New format: JSON array string '["a","b"]'
+    Legacy format: pipe-delimited string 'a|b'
+    """
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        result = json.loads(value)
+        return result if isinstance(result, list) else [str(result)]
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return [v.strip() for v in str(value).split("|") if v.strip()]
 
 
 def build_enriched_document(
@@ -72,10 +90,10 @@ def build_enriched_document(
         "chunk_type": chunk.chunk_type,
         "line_start": chunk.line_start,
         "line_end": chunk.line_end,
-        # pipe-delimited for ChromaDB (it doesn't support list values natively)
-        "canonical_tables": "|".join(canonical_tables),
-        "aliases_used": "|".join(aliases_used),
-        "operations": "|".join(operations),
+        # JSON-encoded lists — safe for any table name including those containing "|"
+        "canonical_tables": json.dumps(canonical_tables),
+        "aliases_used": json.dumps(aliases_used),
+        "operations": json.dumps(operations),
     }
 
     return EnrichedDocument(

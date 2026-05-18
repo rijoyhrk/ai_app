@@ -2,7 +2,10 @@
 Data Lineage Discovery Dashboard
 Enter a root ETL folder + optional exclusions, then search any table name.
 """
+import json
+import logging
 import os
+import re
 import sys
 import tempfile
 import streamlit as st
@@ -18,10 +21,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.config import settings
 from src.ingestion.pipeline import run_ingestion
 from src.ingestion.vector_store import VectorStore
+from src.ingestion.document_builder import parse_meta_list
 from src.extractors.alias_registry import AliasRegistry
 from src.search.hybrid_search import HybridSearchEngine
 from src.search.reranker import rerank
 from src.graph.lineage_graph import LineageGraph
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 # ─── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -62,6 +72,7 @@ def _init_state():
         "store": None,
         "registry": None,
         "engine": None,
+        "engine_chunk_count": -1,   # fingerprint for BM25 cache invalidation
         "ingested": False,
         "results": [],
         "rerank_skipped": False,
@@ -94,15 +105,23 @@ def _load_existing() -> bool:
         st.session_state.registry = registry
         st.session_state.ingested = True
         return True
-    except Exception:
+    except (FileNotFoundError, PermissionError, OSError) as exc:
+        logger.warning("Could not load existing vector store: %s", exc)
+        return False
+    except Exception as exc:
+        logger.error("Unexpected error loading vector store: %s", exc, exc_info=True)
         return False
 
 
 def _parse_excluded(raw: str) -> list[str]:
     """Split comma/newline-separated folder names into a clean list."""
-    import re
     parts = re.split(r"[,\n]+", raw)
     return [p.strip() for p in parts if p.strip()]
+
+
+def _sanitize_query(q: str) -> str:
+    """Allow only alphanumeric, underscore, hyphen, dot, space — cap at 200 chars."""
+    return re.sub(r"[^\w\s\-\.]", "", q)[:200].strip()
 
 
 def _fallback_format(hits: list) -> list:
@@ -113,18 +132,47 @@ def _fallback_format(hits: list) -> list:
     results = []
     for h in hits:
         meta = h.get("metadata", {})
-        ops = meta.get("operations", "")
-        # pick the first operation listed in metadata, default UNKNOWN
-        operation = ops.split("|")[0].strip().upper() if ops else "UNKNOWN"
+        ops_list = parse_meta_list(meta.get("operations", "[]"))
+        operation = ops_list[0].strip().upper() if ops_list else "UNKNOWN"
         result = dict(h)
         result["operation"]    = operation
         result["explanation"]  = "LLM reranking skipped — showing hybrid search score."
-        result["matched_via"]  = "alias" if meta.get("aliases_used") else "direct"
+        result["matched_via"]  = "alias" if parse_meta_list(meta.get("aliases_used", "[]")) else "direct"
         result["llm_score"]    = 0.0
         result["final_score"]  = round(h.get("hybrid_score", 0.0), 4)
         results.append(result)
     results.sort(key=lambda x: x["final_score"], reverse=True)
     return results
+
+
+def _get_or_build_engine(store: VectorStore, registry: AliasRegistry) -> HybridSearchEngine:
+    """Return cached BM25 engine, rebuilding only if the collection has changed."""
+    current_count = store.count()
+    if (
+        st.session_state.engine is not None
+        and st.session_state.engine_chunk_count == current_count
+    ):
+        return st.session_state.engine
+
+    engine = HybridSearchEngine(
+        store, registry,
+        semantic_weight=settings.hybrid_semantic_weight,
+        bm25_weight=settings.hybrid_bm25_weight,
+        metadata_weight=settings.hybrid_metadata_weight,
+    )
+    raw = store._collection.get(include=["documents", "metadatas"])
+    bm25_docs = [
+        {
+            "chunk_id": doc_id,
+            "embedding_text": raw["documents"][i] if raw.get("documents") else "",
+            "metadata": raw["metadatas"][i] if raw.get("metadatas") else {},
+        }
+        for i, doc_id in enumerate(raw.get("ids", []))
+    ]
+    engine.build_bm25_index(bm25_docs)
+    st.session_state.engine = engine
+    st.session_state.engine_chunk_count = current_count
+    return engine
 
 
 def _do_search(query: str) -> tuple[list, bool]:
@@ -136,21 +184,7 @@ def _do_search(query: str) -> tuple[list, bool]:
     registry: AliasRegistry = st.session_state.registry
     client = get_anthropic_client()
 
-    if st.session_state.engine is None:
-        engine = HybridSearchEngine(store, registry)
-        raw = store._collection.get(limit=200, include=["documents", "metadatas"])
-        bm25_docs = [
-            {
-                "chunk_id": doc_id,
-                "embedding_text": raw["documents"][i] if raw.get("documents") else "",
-                "metadata": raw["metadatas"][i] if raw.get("metadatas") else {},
-            }
-            for i, doc_id in enumerate(raw.get("ids", []))
-        ]
-        engine.build_bm25_index(bm25_docs)
-        st.session_state.engine = engine
-
-    engine: HybridSearchEngine = st.session_state.engine
+    engine = _get_or_build_engine(store, registry)
     hits = engine.search(query, top_k=15)
 
     skip_rerank = st.session_state.get("skip_rerank", False)
@@ -165,7 +199,7 @@ def _do_search(query: str) -> tuple[list, bool]:
             return _fallback_format(hits), True
         raise
     except (anthropic.APIStatusError, anthropic.APIConnectionError,
-            anthropic.RateLimitError, anthropic.APITimeoutError) as e:
+            anthropic.RateLimitError, anthropic.APITimeoutError):
         return _fallback_format(hits), True
 
 
@@ -187,7 +221,7 @@ def _group_by_file(results: list) -> dict:
             g["best_score"] = score
         if r.get("matched_via") == "alias":
             g["matched_via"] = "alias"
-        for a in meta.get("aliases_used", "").split("|"):
+        for a in parse_meta_list(meta.get("aliases_used", "[]")):
             if a.strip():
                 g["aliases_used"].add(a.strip())
     for g in groups.values():
@@ -255,10 +289,12 @@ with st.sidebar:
                     excluded_dirs=excluded_list or None,
                     skip_llm=skip_llm,
                     verbose=False,
+                    max_extraction_workers=settings.max_extraction_workers,
                 )
                 st.session_state.store = store
                 st.session_state.registry = registry
                 st.session_state.engine = None
+                st.session_state.engine_chunk_count = -1  # force BM25 rebuild
                 st.session_state.ingested = True
                 st.session_state.indexed_path = etl_path.strip()
                 st.session_state.indexed_excluded = excluded_list
@@ -293,11 +329,14 @@ with st.sidebar:
         if not st.session_state.ingested:
             st.warning("Please index ETL files first.")
         else:
-            with st.spinner(f"Searching for **{table_query.strip()}**…"):
-                results, rerank_skipped = _do_search(table_query.strip())
+            sanitized = _sanitize_query(table_query.strip())
+            if sanitized != table_query.strip():
+                st.info(f"Query sanitized to: `{sanitized}`")
+            with st.spinner(f"Searching for **{sanitized}**…"):
+                results, rerank_skipped = _do_search(sanitized)
                 st.session_state.results = results
                 st.session_state.rerank_skipped = rerank_skipped
-                st.session_state.query = table_query.strip()
+                st.session_state.query = sanitized
 
     st.divider()
 
