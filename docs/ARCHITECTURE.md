@@ -1,6 +1,6 @@
 # Data Lineage Discovery Dashboard — Solution Architecture
 
-**Version:** 1.0  
+**Version:** 2.0  
 **Type:** Production Prototype  
 **Stack:** Python 3.11 · Streamlit · ChromaDB · Anthropic Claude · GCP Secret Manager
 
@@ -108,8 +108,10 @@ graph TB
 **Resolution order:**
 ```
 GCP_PROJECT_ID set in env?
-  YES → call GCP Secret Manager via ADC → return secret value
-  NO  → read ANTHROPIC_API_KEY from env/.env → return value
+  YES → call GCP Secret Manager via ADC (5s timeout)
+        → success: use fetched key
+        → failure: log WARNING, fall through to ANTHROPIC_API_KEY
+  ANTHROPIC_API_KEY set in env/.env → use it
   NEITHER → raise ValueError (fail fast, clear message)
 ```
 
@@ -168,8 +170,11 @@ metadata    : dict
 **Claude call parameters:**
 - Model: `claude-opus-4-7` (configurable via `LLM_MODEL`)
 - Max tokens: `1024` per chunk
+- Timeout: `60` seconds per call
 - System prompt: cached with `"cache_control": {"type": "ephemeral"}` to reduce API cost across chunks
 - Code truncated to `4000` chars per chunk to control token usage
+
+**Parallel extraction:** `batch_extract_entities()` uses `ThreadPoolExecutor` with up to `MAX_EXTRACTION_WORKERS` (default 8) concurrent threads. A 150-chunk repo that took ~2.5 minutes sequentially completes in ~20 seconds at 8 workers. Individual chunk failures are caught, logged, and the chunk is indexed with empty entity metadata rather than halting the run.
 
 **Output — `EntityRef`:**
 ```json
@@ -190,7 +195,7 @@ txn_tab, trans_tab              → transaction
 ```
 Claude extends these with domain-context inference for patterns not in the list.
 
-**Error handling:** JSON decode failures return empty `refs` list (chunk is indexed without entity metadata rather than failing ingestion).
+**Error handling:** JSON decode failures are logged (with the first 300 chars of the raw response) and return an empty `refs` list — the chunk is still indexed without entity metadata rather than halting ingestion.
 
 ---
 
@@ -217,6 +222,8 @@ _alias_to_canonical: Dict[str, str]      # alias → canonical (for O(1) lookup)
 
 **Persistence:** JSON file at `ALIAS_REGISTRY_PATH` (default: `./data/alias_registry.json`). Survives app restarts. Re-ingestion merges new aliases rather than replacing.
 
+**Atomic writes:** `save()` writes to a `.tmp` file first, then calls `os.replace()` to atomically swap it into place. This prevents corrupt JSON if the process is killed mid-write or two sessions write simultaneously.
+
 ---
 
 ### 3.5 Document Builder — `src/ingestion/document_builder.py`
@@ -240,18 +247,19 @@ Language: python, block type: function
 
 The `[ENTITIES]` section is the key innovation — it injects canonical names into the embedding so that searching for `customer` surfaces chunks that only contain `cust_data` in their raw code.
 
-**ChromaDB metadata (pipe-delimited strings — ChromaDB does not support list values):**
+**ChromaDB metadata (JSON-encoded strings — ChromaDB requires string scalar values):**
 ```python
 {
-    "canonical_tables": "customer|orders",
-    "aliases_used":     "cust_data",
-    "operations":       "READ",
+    "canonical_tables": '["customer", "orders"]',   # json.dumps(list)
+    "aliases_used":     '["cust_data"]',
+    "operations":       '["READ"]',
     "file_path":        "data/sample_etl/orders_pipeline.py",
     "file_type":        "python",
     "line_start":       28,
     "line_end":         44,
 }
 ```
+JSON encoding is safe for table names containing any character (including `|`). The `parse_meta_list()` helper in `document_builder.py` decodes these fields and falls back to legacy pipe-split for backward compatibility with old indexes.
 
 ---
 
@@ -269,11 +277,21 @@ The `[ENTITIES]` section is the key innovation — it injects canonical names in
 
 | Method | Description |
 |---|---|
-| `upsert(docs)` | Inserts or updates documents; uses `chunk_id` as ChromaDB ID |
+| `reset()` | Creates a staging collection (`etl_lineage_staging`); old `etl_lineage` data is untouched |
+| `upsert(docs)` | Writes to staging (after `reset()`) or directly to main collection (test mode) |
+| `commit()` | Atomically promotes staging → main by copying pre-computed embeddings; deletes staging |
 | `query_semantic(text, n_results)` | Cosine similarity search; returns hits with `score` (0–1) |
-| `query_by_table(canonical, n_results)` | Metadata `where` filter on `canonical_tables` field; post-filter fallback if `$contains` unsupported |
+| `query_by_table(canonical, n_results)` | Metadata `where` filter on `canonical_tables`; post-filters with `parse_meta_list()` for exact membership |
 | `count()` | Total chunks in the collection |
-| `reset()` | Drops and recreates the collection |
+
+**Safe re-indexing sequence:**
+```
+store.reset()   → staging collection created; old data preserved
+store.upsert()  → data written to staging
+store.commit()  → staging promoted to main (embedding copy, no re-embedding cost)
+                  old main deleted; staging deleted
+```
+If the process crashes between `reset()` and `commit()`, the old `etl_lineage` collection is intact. Stale staging collections are cleaned up at next `VectorStore.__init__`.
 
 ---
 
@@ -283,7 +301,8 @@ The `[ENTITIES]` section is the key innovation — it injects canonical names in
 
 ```
 run_ingestion(repo_path, chroma_persist_dir, alias_registry_path,
-              anthropic_client, llm_model, excluded_dirs, verbose)
+              anthropic_client, llm_model, excluded_dirs, verbose,
+              max_extraction_workers)
               → (VectorStore, AliasRegistry)
 ```
 
@@ -291,13 +310,17 @@ run_ingestion(repo_path, chroma_persist_dir, alias_registry_path,
 ```
 [1/4] crawl_and_chunk(repo_path, excluded_dirs)
          → List[CodeChunk]
-[2/4] batch_extract_entities(client, chunks, model)
+[2/4] batch_extract_entities(client, chunks, model, max_workers=8)   ← parallel
          → List[ChunkEntities]
-[3/4] AliasRegistry.load() → .ingest() → .save()
+[3/4] AliasRegistry.load() → .ingest()                               ← in memory only
          → AliasRegistry
-[4/4] build_enriched_documents() → VectorStore.upsert()
-         → VectorStore
+[4/4] build_enriched_documents() → store.reset() → store.upsert()
+      → store.commit()                                                ← atomic swap
+      → registry.save()                                               ← after commit
+         → (VectorStore, AliasRegistry)
 ```
+
+**Transactional guarantee:** `registry.save()` runs only after `store.commit()` succeeds. If `upsert` or `commit` fails, the previous registry file and vector collection are both preserved.
 
 ---
 
@@ -313,18 +336,21 @@ all_terms = {"customer", "cust_tab", "cust_data", "CUST", "cust_tbl"}
 
 **Score fusion formula:**
 ```
-hybrid_score = (0.60 × semantic_score)
-             + (0.25 × bm25_score_normalised)
-             + (0.15 × metadata_bonus)
+hybrid_score = (semantic_weight  × semantic_score)
+             + (bm25_weight      × bm25_score_normalised)
+             + (metadata_weight  × metadata_bonus)
 ```
+Weights default to `0.60 / 0.25 / 0.15` and are tunable via env vars (`HYBRID_SEMANTIC_WEIGHT`, `HYBRID_BM25_WEIGHT`, `HYBRID_METADATA_WEIGHT`) or per-call overrides on `search()`.
 
 **Layer details:**
 
-| Layer | Weight | Mechanism |
+| Layer | Default Weight | Mechanism |
 |---|---|---|
 | Semantic | 60% | ChromaDB cosine on enriched `embedding_text`; query augmented with `"{query} {canonical} table references"` |
-| BM25 | 25% | `BM25Okapi` index built on first 200 stored docs at search time; tokenizes all alias variants |
+| BM25 | 25% | `BM25Okapi` index built once per session and cached (rebuilt only when chunk count changes); tokenizes all alias variants |
 | Metadata | 15% | Flat bonus added to any chunk whose `canonical_tables` metadata field contains the canonical name |
+
+**BM25 caching:** The index is built once per Streamlit session and stored in `session_state`. A fingerprint (`store.count()`) detects collection changes and triggers a rebuild. This avoids reloading all documents on every search.
 
 **Deduplication:** Results merged by `chunk_id`; sources dict keeps first-seen document data.
 
@@ -682,15 +708,19 @@ docker run -p 8501:8501 \
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `GCP_PROJECT_ID` | Prod only | `""` | GCP project ID. If set, triggers Secret Manager fetch. |
+| `GCP_PROJECT_ID` | Prod only | `""` | GCP project ID. If set, triggers Secret Manager fetch (5s timeout, falls back to `ANTHROPIC_API_KEY` on failure). |
 | `GCP_SECRET_NAME` | Prod only | `anthropic-api-key` | Secret resource name in Secret Manager. |
 | `GCP_SECRET_VERSION` | No | `latest` | Secret version. Pin to a number (e.g. `3`) for reproducibility. |
-| `ANTHROPIC_API_KEY` | Local dev | `""` | Direct API key. Used only when `GCP_PROJECT_ID` is unset. |
+| `ANTHROPIC_API_KEY` | Local dev | `""` | Direct API key. Used when `GCP_PROJECT_ID` is unset or GCP fetch fails. |
 | `ETL_REPO_PATH` | No | `./data/sample_etl` | Default ETL folder shown in sidebar on startup. |
 | `CHROMA_PERSIST_DIR` | No | `./chroma_db` | Where ChromaDB persists its index to disk. |
 | `ALIAS_REGISTRY_PATH` | No | `./data/alias_registry.json` | Where the alias registry JSON is saved. |
 | `LLM_MODEL` | No | `claude-opus-4-7` | Claude model for entity extraction and reranking. |
 | `EMBEDDING_MODEL` | No | `all-MiniLM-L6-v2` | Sentence-transformers model for vector embeddings. |
+| `MAX_EXTRACTION_WORKERS` | No | `8` | Thread pool size for parallel LLM entity extraction. |
+| `HYBRID_SEMANTIC_WEIGHT` | No | `0.6` | Semantic search weight in hybrid score fusion. |
+| `HYBRID_BM25_WEIGHT` | No | `0.25` | BM25 keyword search weight in hybrid score fusion. |
+| `HYBRID_METADATA_WEIGHT` | No | `0.15` | Metadata filter weight in hybrid score fusion. |
 
 ### Gitignored Files (never committed)
 
@@ -713,11 +743,13 @@ docker run -p 8501:8501 \
 client.messages.create(
     model      = "claude-opus-4-7",
     max_tokens = 1024,
+    timeout    = 60,            # hard timeout per chunk call
     system     = [{"type": "text", "text": SYSTEM_PROMPT,
                    "cache_control": {"type": "ephemeral"}}],
     messages   = [{"role": "user", "content": EXTRACTION_PROMPT}]
 )
 # Response: JSON array of EntityRef objects
+# On JSON parse failure: logs warning with raw response excerpt; returns empty refs
 ```
 
 **Reranking** (`src/search/reranker.py`):
@@ -725,11 +757,13 @@ client.messages.create(
 client.messages.create(
     model      = "claude-opus-4-7",
     max_tokens = 2048,
+    timeout    = 60,            # hard timeout for the batched rerank call
     system     = [{"type": "text", "text": RERANK_SYSTEM,
                    "cache_control": {"type": "ephemeral"}}],
     messages   = [{"role": "user", "content": RERANK_USER}]
 )
 # Response: JSON array of {chunk_id, relevance_score, operation, explanation, matched_via}
+# On JSON parse failure: logs warning with raw response; returns empty enriched list
 ```
 
 Both calls use **prompt caching** on the system prompt (`ephemeral` cache). This means the system prompt is only billed at full token cost on the first call per cache lifetime (~5 minutes), reducing ingestion and reranking costs significantly for large repositories.
@@ -802,21 +836,38 @@ collection.query(query_texts=[text], n_results=n,
 |---|---|---|
 | No authentication on dashboard | Anyone with network access can use it | Bind to localhost + SSH tunnel for access |
 | ChromaDB is single-node | Not horizontally scalable | Sufficient for repos up to ~50K files |
-| Entity extraction is sequential | Slow for very large repos (>500 files) | Batch with `concurrent.futures` (roadmap) |
-| BM25 index built from first 200 docs | Misses BM25 signal for large collections | Increase limit or use persistent BM25 index |
 | Alias inference relies on LLM | Hallucination risk for ambiguous names | Review alias registry in sidebar before trusting |
 | No secret rotation webhook | App must restart to pick up new key version | Pin `GCP_SECRET_VERSION` and restart on rotation |
+| Streamlit single-session model | Multiple concurrent users cause shared-state conflicts | Deploy separate instances per user team |
 
-### Production Hardening Roadmap
+### Implemented Production Fixes (v2.0)
+
+| Category | Fix | Where |
+|---|---|---|
+| **Critical** | Parallel entity extraction (8 workers, `ThreadPoolExecutor`) | `entity_extractor.py` |
+| **Critical** | Staging collection + `commit()` — old index preserved on crash | `vector_store.py` |
+| **Critical** | Atomic registry save via `os.replace()` — no corruption under concurrent writes | `alias_registry.py` |
+| **Critical** | Registry persisted only after vector store commit succeeds | `pipeline.py` |
+| **High** | 60s timeout on all Anthropic API calls | `entity_extractor.py`, `reranker.py` |
+| **High** | GCP Secret Manager: 5s timeout + fall-through to env var on failure | `gcp_secret_manager.py`, `config.py` |
+| **High** | BM25 index cached by chunk-count fingerprint — rebuilt only on collection change | `app.py` |
+| **Medium** | JSON parse failures logged with raw response excerpt | `entity_extractor.py`, `reranker.py` |
+| **Medium** | Metadata stored as JSON arrays (safe for table names containing `\|`) | `document_builder.py` |
+| **Medium** | `_load_existing()` catches specific exceptions (not bare `except Exception`) | `app.py` |
+| **Low** | Structured audit logging for ingestion start/complete | `pipeline.py` |
+| **Low** | Hybrid weights configurable via env vars (`HYBRID_*_WEIGHT`) | `config.py`, `hybrid_search.py` |
+| **Low** | Input sanitization before LLM query (`_sanitize_query`) | `app.py` |
+| **Low** | BM25 corpus pre-tokenized at index build time | `hybrid_search.py` |
+
+### Remaining Production Roadmap
 
 | Priority | Item | Effort |
 |---|---|---|
 | High | Add authentication (OAuth2 / IAP on GCP) | Medium |
-| High | Parallel entity extraction with `asyncio` or `ThreadPoolExecutor` | Low |
 | High | Pin `GCP_SECRET_VERSION` and add rotation restart hook | Low |
 | Medium | Replace local ChromaDB with managed vector DB (Pinecone / Weaviate) | High |
 | Medium | Persistent BM25 index (serialise to disk alongside ChromaDB) | Low |
-| Medium | Add observability: structured logging + Cloud Logging integration | Medium |
+| Medium | Cloud Logging integration for audit trail | Medium |
 | Low | CI/CD pipeline (GitHub Actions → Cloud Run or GCE) | Medium |
 | Low | Multi-repo support (index multiple ETL repos into separate collections) | Medium |
 | Low | Incremental re-ingestion (only re-index changed files via git diff) | High |

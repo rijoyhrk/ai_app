@@ -6,8 +6,11 @@ Takes top-K hybrid search results and asks Claude to:
   3. Identify the operation type (READ/WRITE/CREATE/etc.)
 """
 import json
+import logging
 import anthropic
 from typing import List, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 _RERANK_SYSTEM = """You are a data lineage expert. Given a user query about a database table
 and a set of code snippets, evaluate each snippet for relevance.
@@ -73,6 +76,7 @@ def rerank(
     response = client.messages.create(
         model=model,
         max_tokens=2048,
+        timeout=60,
         system=[{
             "type": "text",
             "text": _RERANK_SYSTEM,
@@ -90,7 +94,11 @@ def rerank(
 
     try:
         rerank_results = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "Reranker JSON parse failed for entity '%s': %s | raw response (first 500 chars): %.500s",
+            entity, exc, text,
+        )
         rerank_results = []
 
     # Merge LLM scores back into hits

@@ -143,9 +143,11 @@ class TestFullIngestionPipeline:
     def test_metadata_filter_returns_customer_chunks(self, ingested_store_and_registry):
         store, _ = ingested_store_and_registry
         hits = store.query_by_table("customer", n_results=10)
-        # All returned chunks must reference "customer" in metadata
+        # All returned chunks must reference "customer" in canonical_tables metadata
         for h in hits:
-            assert "customer" in h["metadata"].get("canonical_tables", "")
+            from src.ingestion.document_builder import parse_meta_list
+            tables = parse_meta_list(h["metadata"].get("canonical_tables", "[]"))
+            assert "customer" in tables
 
 
 class TestFullSearchPipeline:

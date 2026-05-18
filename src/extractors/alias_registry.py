@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Set
 from dataclasses import dataclass, field
@@ -73,14 +74,18 @@ class AliasRegistry:
         return sorted(self._by_canonical.keys())
 
     def save(self, path: str) -> None:
+        """Atomically write the registry to disk (temp file + os.replace)."""
         data = {}
         for canonical, entry in self._by_canonical.items():
             data[canonical] = {
                 "aliases": sorted(entry.aliases),
                 "files": sorted(entry.files),
             }
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(data, indent=2))
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = p.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(data, indent=2))
+        os.replace(str(tmp_path), str(p))
 
     @classmethod
     def load(cls, path: str) -> "AliasRegistry":

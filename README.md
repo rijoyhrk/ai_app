@@ -49,11 +49,11 @@ The system is built in six layers:
 | Layer | What it does |
 |---|---|
 | **AST-aware chunking** | Splits `.sql` (sqlglot), `.py` (Python ast), `.sh` (regex) at logical code boundaries — functions, statements, command groups |
-| **LLM entity extraction** | Claude reads each chunk and emits `{raw, canonical, type, confidence}` — e.g. `cust_tab → customer` |
-| **Alias registry** | Persistent JSON mapping every alias → canonical table name; used to expand queries at search time |
+| **LLM entity extraction** | Claude reads chunks in parallel (8 threads) and emits `{raw, canonical, type, confidence}` — e.g. `cust_tab → customer` |
+| **Alias registry** | Persistent JSON mapping every alias → canonical table name; atomic writes via `os.replace()`; used to expand queries at search time |
 | **Enriched embeddings** | Embedding text = raw code + extracted canonical entity metadata; bridges the alias→canonical semantic gap |
-| **Hybrid search** | Semantic (ChromaDB cosine, 60%) + BM25 keyword across all alias variants (25%) + metadata filter (15%) |
-| **LLM reranker** | Claude scores each hit 0–1, tags operation type and match reason; `final_score = 0.4×hybrid + 0.6×llm` |
+| **Hybrid search** | Semantic (ChromaDB cosine, 60%) + BM25 keyword across all alias variants (25%) + metadata filter (15%); weights configurable via env vars |
+| **LLM reranker** | Claude scores each hit 0–1, tags operation type and match reason; `final_score = 0.4×hybrid + 0.6×llm`; 60s timeout + auto-fallback |
 
 ## Project Structure
 
@@ -117,11 +117,17 @@ Key settings in `.env`:
 
 ```env
 ANTHROPIC_API_KEY=sk-ant-...
-ETL_REPO_PATH=data/sample_etl     # path to your ETL scripts
+ETL_REPO_PATH=data/sample_etl        # path to your ETL scripts
 CHROMA_PERSIST_DIR=chroma_db
 ALIAS_REGISTRY_PATH=alias_registry.json
 LLM_MODEL=claude-opus-4-7
 EMBEDDING_MODEL=all-MiniLM-L6-v2
+
+# Optional tuning
+MAX_EXTRACTION_WORKERS=8             # parallel threads for LLM entity extraction
+HYBRID_SEMANTIC_WEIGHT=0.6           # search score weights (must sum ≤ 1)
+HYBRID_BM25_WEIGHT=0.25
+HYBRID_METADATA_WEIGHT=0.15
 ```
 
 ### Run

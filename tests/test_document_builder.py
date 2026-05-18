@@ -110,16 +110,19 @@ class TestBuildEnrichedDocument:
         doc = build_enriched_document(chunk, entities)
         assert "cust_data" in doc.embedding_text
 
-    def test_metadata_fields_pipe_delimited(self):
+    def test_metadata_fields_json_encoded(self):
+        import json
         chunk = _chunk()
         entities = _entities(chunk.chunk_id, chunk.file_path, [
             {"raw": "cust_tab", "canonical": "customer", "ref_type": "READ",  "confidence": "high"},
             {"raw": "ord_tab",  "canonical": "orders",   "ref_type": "WRITE", "confidence": "high"},
         ])
         doc = build_enriched_document(chunk, entities)
-        # ChromaDB doesn't support lists — must be pipe-delimited strings
+        # ChromaDB requires string metadata values — must be JSON-encoded lists
         assert isinstance(doc.metadata["canonical_tables"], str)
-        assert "|" in doc.metadata["canonical_tables"] or len(doc.canonical_tables) == 1
+        tables = json.loads(doc.metadata["canonical_tables"])
+        assert "customer" in tables
+        assert "orders" in tables
 
     def test_metadata_contains_file_path(self):
         chunk = _chunk(file_path="etl/load.sql")

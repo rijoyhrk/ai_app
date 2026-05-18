@@ -1,8 +1,12 @@
 import json
+import logging
 import anthropic
-from typing import List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import List
 from dataclasses import dataclass, field
 from src.chunkers.base import CodeChunk
+
+logger = logging.getLogger(__name__)
 
 _SYSTEM_PROMPT = """You are an expert data lineage analyst specializing in ETL code.
 Your job is to extract all table, dataset, and view references from code chunks and
@@ -74,12 +78,13 @@ def extract_entities(
         file_type=chunk.file_type,
         line_start=chunk.line_start,
         line_end=chunk.line_end,
-        code=chunk.raw_text[:4000],  # cap to avoid token bloat
+        code=chunk.raw_text[:4000],
     )
 
     response = client.messages.create(
         model=model,
         max_tokens=1024,
+        timeout=60,
         system=[{
             "type": "text",
             "text": _SYSTEM_PROMPT,
@@ -90,7 +95,6 @@ def extract_entities(
 
     text = next((b.text for b in response.content if b.type == "text"), "[]")
     text = text.strip()
-    # strip markdown code fences if Claude wraps the JSON
     if text.startswith("```"):
         text = text.split("```")[1]
         if text.startswith("json"):
@@ -99,7 +103,11 @@ def extract_entities(
 
     try:
         raw_refs = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "Entity extraction JSON parse failed for %s: %s | raw: %.300s",
+            chunk.chunk_id, exc, text,
+        )
         raw_refs = []
 
     refs = []
@@ -120,13 +128,25 @@ def batch_extract_entities(
     client: anthropic.Anthropic,
     chunks: List[CodeChunk],
     model: str = "claude-opus-4-7",
+    max_workers: int = 8,
 ) -> List[ChunkEntities]:
-    """Extract entities from a list of chunks sequentially."""
-    results = []
-    for chunk in chunks:
-        # skip empty or trivially small chunks
-        if len(chunk.raw_text.strip()) < 10:
-            continue
-        result = extract_entities(client, chunk, model)
-        results.append(result)
+    """Extract entities from chunks in parallel using a thread pool."""
+    eligible = [c for c in chunks if len(c.raw_text.strip()) >= 10]
+    if not eligible:
+        return []
+
+    def _safe_extract(chunk: CodeChunk) -> ChunkEntities:
+        try:
+            return extract_entities(client, chunk, model)
+        except Exception as exc:
+            logger.warning(
+                "Entity extraction failed for %s: %s — indexing chunk with no entities.",
+                chunk.chunk_id, exc,
+            )
+            return ChunkEntities(chunk_id=chunk.chunk_id, file_path=chunk.file_path)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        # executor.map preserves order
+        results = list(pool.map(_safe_extract, eligible))
+
     return results
