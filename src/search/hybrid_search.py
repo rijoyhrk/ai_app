@@ -92,7 +92,8 @@ class HybridSearchEngine:
                 bm25_query_tokens.extend(self._tokenize(term))
 
             bm25_scores = self._bm25_index.get_scores(bm25_query_tokens)
-            max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
+            _max = float(bm25_scores.max()) if len(bm25_scores) > 0 else 0.0
+            max_bm25 = _max if _max > 0.0 else 1.0
 
             for i, doc in enumerate(self._bm25_corpus):
                 norm_score = bm25_scores[i] / max_bm25
